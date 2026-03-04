@@ -1,0 +1,5 @@
+{
+  "name": "TaqwaShield AI",
+  "description": "An AI-powered Chrome Extension that detects and blurs inappropriate images in real-time.",
+  "requestFramePermissions": []
+}
