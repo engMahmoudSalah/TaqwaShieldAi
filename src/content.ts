@@ -129,13 +129,13 @@ const releaseElement = (el: HTMLElement) => {
   el.removeAttribute('data-taqwashield-pending');
   if (!el.hasAttribute('data-taqwashield-blurred')) el.style.filter = '';
 };
-const blurElement = (el: HTMLElement) => {
+const blurElement = (el: HTMLElement, count = true) => {
   el.removeAttribute('data-taqwashield-pending');
   if (el.getAttribute('data-taqwashield-blurred') === 'true') return;
   el.style.filter = 'blur(40px)';
   el.style.transition = 'filter 0.3s ease-in-out';
   el.setAttribute('data-taqwashield-blurred', 'true');
-  countBlur();
+  if (count) countBlur();
 };
 const unblurAllMedia = () => {
   document.querySelectorAll('[data-taqwashield-blurred="true"], [data-taqwashield-pending="true"]').forEach((el) => {
@@ -154,6 +154,37 @@ const loadImage = (url: string) =>
     img.src = url;
   });
 
+// Ask the extension's background worker to download an image the page itself cannot read (no CORS headers).
+// The worker has host permissions, so it can fetch it and hand back a same-origin data URL.
+const fetchViaBackground = (url: string) =>
+  new Promise<string | null>((resolve) => {
+    if (typeof chrome === 'undefined' || !chrome.runtime?.id) return resolve(null);
+    try {
+      chrome.runtime.sendMessage({ action: 'fetchImage', url }, (res) => {
+        if (chrome.runtime.lastError || !res || !res.dataUrl) resolve(null);
+        else resolve(res.dataUrl as string);
+      });
+    } catch {
+      resolve(null);
+    }
+  });
+
+const classifyUrl = async (m: nsfwjs.NSFWJS, url: string): Promise<Scores | null> => {
+  // 1) direct, 2) through the background worker
+  for (const attempt of [0, 1]) {
+    try {
+      const src = attempt === 0 ? url : await fetchViaBackground(url);
+      if (!src) continue;
+      const img = await loadImage(src);
+      if (img.naturalWidth < MIN_SIZE || img.naturalHeight < MIN_SIZE) return { strong: 0, sexy: 0 };
+      return toScores(await m.classify(img));
+    } catch {
+      /* try the next way */
+    }
+  }
+  return null;
+};
+
 // Check one image URL and blur or release the element
 const processImageUrl = async (url: string, el: HTMLElement) => {
   const cached = mediaCache.get(url);
@@ -163,16 +194,14 @@ const processImageUrl = async (url: string, el: HTMLElement) => {
   }
   const m = await loadModel();
   if (!m || !isEnabled) { releaseElement(el); return; }
-  try {
-    const img = await loadImage(url);
-    if (img.naturalWidth < MIN_SIZE || img.naturalHeight < MIN_SIZE) { mediaCache.set(url, { strong: 0, sexy: 0 }); releaseElement(el); return; }
-    const scores = toScores(await m.classify(img));
-    mediaCache.set(url, scores);
-    if (isFlagged(scores)) blurElement(el); else releaseElement(el);
-  } catch {
-    // The image could not be read (blocked by CORS or failed to load). Show it rather than break the page.
-    releaseElement(el);
+  const scores = await classifyUrl(m, url);
+  if (!scores) {
+    // Still unreadable after the background fetch: keep it hidden rather than show an unchecked image.
+    if (el.tagName === 'IMG') blurElement(el, false); else releaseElement(el);
+    return;
   }
+  mediaCache.set(url, scores);
+  if (isFlagged(scores)) blurElement(el); else releaseElement(el);
 };
 
 const videoTimers = new WeakMap<HTMLVideoElement, number>();
