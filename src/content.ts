@@ -41,12 +41,16 @@ class LRUCache<K, V> {
 
 // Configuration and state
 let model: nsfwjs.NSFWJS | null = null;
+let modelPromise: Promise<nsfwjs.NSFWJS | null> | null = null;
 let isEnabled = true;
 let sensitivity = 'Medium';
 let blurFemales = true;
-const mediaCache = new LRUCache<string, boolean>(2000); // URL -> isNSFW
+let started = false;
 
-// Thresholds based on sensitivity
+// Cache keeps the raw scores, so changing sensitivity re-evaluates without re-classifying.
+type Scores = { strong: number; sexy: number };
+const mediaCache = new LRUCache<string, Scores>(2000);
+
 const getThreshold = () => {
   switch (sensitivity) {
     case 'Low': return 0.8;
@@ -56,245 +60,259 @@ const getThreshold = () => {
   }
 };
 
-// Initialize settings from storage
-const initSettings = async () => {
-  return new Promise<void>((resolve) => {
-    if (typeof chrome !== 'undefined' && chrome.storage) {
-      chrome.storage.local.get(['enabled', 'sensitivity', 'blurFemales'], (result) => {
-        isEnabled = (result.enabled as boolean) ?? true;
-        sensitivity = (result.sensitivity as string) ?? 'Medium';
-        blurFemales = (result.blurFemales as boolean) ?? true;
-        resolve();
-      });
-      
-      chrome.storage.onChanged.addListener((changes) => {
-        if (changes.enabled) isEnabled = changes.enabled.newValue as boolean;
-        if (changes.sensitivity) sensitivity = changes.sensitivity.newValue as string;
-        if (changes.blurFemales) blurFemales = changes.blurFemales.newValue as boolean;
-        
-        if (isEnabled) {
-          scanAllMedia();
-        } else {
-          unblurAllMedia();
-        }
-      });
-    } else {
-      resolve();
-    }
-  });
-};
+const MIN_SIZE = 48; // ignore icons and tracking pixels
 
-// Load the NSFWJS model
-const loadModel = async () => {
-  if (model) return model;
-  try {
-    await tf.ready();
-    model = await nsfwjs.load();
-    console.log('TaqwaShield: Model loaded successfully');
-    return model;
-  } catch (error) {
-    console.error('TaqwaShield: Error loading model', error);
-    return null;
+const toScores = (predictions: { className: string; probability: number }[]): Scores => {
+  let strong = 0;
+  let sexy = 0;
+  for (const p of predictions) {
+    if (p.className === 'Porn' || p.className === 'Hentai') strong = Math.max(strong, p.probability);
+    if (p.className === 'Sexy') sexy = p.probability;
+  }
+  return { strong, sexy };
+};
+// The model has no female detector, so the "Sexy" class is used as a proxy when that option is on.
+const isFlagged = (s: Scores) => s.strong > getThreshold() || (blurFemales && s.sexy > getThreshold());
+
+// Small work queue: classify at most 2 media items at a time so busy pages stay responsive.
+const MAX_CONCURRENT = 2;
+let running = 0;
+const queue: Array<() => Promise<void>> = [];
+const enqueue = (job: () => Promise<void>) => {
+  queue.push(job);
+  pump();
+};
+const pump = () => {
+  while (running < MAX_CONCURRENT && queue.length) {
+    const job = queue.shift()!;
+    running++;
+    job().finally(() => {
+      running--;
+      pump();
+    });
   }
 };
 
-// Apply blur effect
+// Load the NSFWJS model once
+const loadModel = (): Promise<nsfwjs.NSFWJS | null> => {
+  if (model) return Promise.resolve(model);
+  if (!modelPromise) {
+    modelPromise = (async () => {
+      try {
+        await tf.ready();
+        model = await nsfwjs.load();
+        return model;
+      } catch (error) {
+        console.error('TaqwaShield: Error loading model', error);
+        modelPromise = null;
+        return null;
+      }
+    })();
+  }
+  return modelPromise;
+};
+
+const countBlur = () => {
+  if (typeof chrome !== 'undefined' && chrome.runtime?.id) {
+    try { chrome.runtime.sendMessage({ action: 'incrementBlurCount' }); } catch { /* extension reloaded */ }
+  }
+};
+
+// Proactive blur: hide an image while it is being checked
+const holdElement = (el: HTMLElement) => {
+  if (el.hasAttribute('data-taqwashield-blurred') || el.hasAttribute('data-taqwashield-pending')) return;
+  el.setAttribute('data-taqwashield-pending', 'true');
+  el.style.filter = 'blur(40px)';
+};
+const releaseElement = (el: HTMLElement) => {
+  if (!el.hasAttribute('data-taqwashield-pending')) return;
+  el.removeAttribute('data-taqwashield-pending');
+  if (!el.hasAttribute('data-taqwashield-blurred')) el.style.filter = '';
+};
 const blurElement = (el: HTMLElement) => {
+  el.removeAttribute('data-taqwashield-pending');
+  if (el.getAttribute('data-taqwashield-blurred') === 'true') return;
   el.style.filter = 'blur(40px)';
   el.style.transition = 'filter 0.3s ease-in-out';
   el.setAttribute('data-taqwashield-blurred', 'true');
-  
-  if (typeof chrome !== 'undefined' && chrome.runtime) {
-    chrome.runtime.sendMessage({ action: 'incrementBlurCount' });
-  }
+  countBlur();
 };
-
-// Remove blur effect
 const unblurAllMedia = () => {
-  const blurredElements = document.querySelectorAll('[data-taqwashield-blurred="true"]');
-  blurredElements.forEach((el) => {
+  document.querySelectorAll('[data-taqwashield-blurred="true"], [data-taqwashield-pending="true"]').forEach((el) => {
     (el as HTMLElement).style.filter = '';
     el.removeAttribute('data-taqwashield-blurred');
+    el.removeAttribute('data-taqwashield-pending');
   });
 };
 
-// Process image URL
-const processImageUrl = async (url: string, el: HTMLElement) => {
-  if (!model) return;
+const loadImage = (url: string) =>
+  new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = url;
+  });
 
-  if (mediaCache.has(url)) {
-    if (mediaCache.get(url)) {
-      blurElement(el);
-    }
+// Check one image URL and blur or release the element
+const processImageUrl = async (url: string, el: HTMLElement) => {
+  const cached = mediaCache.get(url);
+  if (cached) {
+    if (isFlagged(cached)) blurElement(el); else releaseElement(el);
     return;
   }
-
+  const m = await loadModel();
+  if (!m || !isEnabled) { releaseElement(el); return; }
   try {
-    const imgClone = new Image();
-    imgClone.crossOrigin = 'anonymous';
-    imgClone.src = url;
-    
-    await new Promise((resolve, reject) => {
-      imgClone.onload = resolve;
-      imgClone.onerror = reject;
-    });
-
-    const predictions = await model.classify(imgClone);
-    const threshold = getThreshold();
-    // Note: The current model does not have a specific 'female' detector.
-    // We use the 'Sexy' category as a proxy for this feature.
-    const isNSFW = predictions.some(p => 
-      (p.className === 'Porn' || p.className === 'Hentai' || (blurFemales && p.className === 'Sexy')) && p.probability > threshold
-    );
-
-    mediaCache.set(url, isNSFW);
-
-    if (isNSFW) {
-      blurElement(el);
-    }
-  } catch (error) {
-    mediaCache.set(url, false); 
+    const img = await loadImage(url);
+    if (img.naturalWidth < MIN_SIZE || img.naturalHeight < MIN_SIZE) { mediaCache.set(url, { strong: 0, sexy: 0 }); releaseElement(el); return; }
+    const scores = toScores(await m.classify(img));
+    mediaCache.set(url, scores);
+    if (isFlagged(scores)) blurElement(el); else releaseElement(el);
+  } catch {
+    // The image could not be read (blocked by CORS or failed to load). Show it rather than break the page.
+    releaseElement(el);
   }
 };
 
-// Analyze Video Frame
+const videoTimers = new WeakMap<HTMLVideoElement, number>();
 const analyzeVideoFrame = async (video: HTMLVideoElement) => {
-  if (!isEnabled || !model || video.readyState < 2) return;
-
+  if (!isEnabled || video.readyState < 2 || video.videoWidth < MIN_SIZE) return;
+  const m = await loadModel();
+  if (!m) return;
   try {
     const canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth || 300;
-    canvas.height = video.videoHeight || 150;
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    
-    const predictions = await model.classify(canvas);
-    const threshold = getThreshold();
-    // Note: The current model does not have a specific 'female' detector.
-    // We use the 'Sexy' category as a proxy for this feature.
-    const isNSFW = predictions.some(p => 
-      (p.className === 'Porn' || p.className === 'Hentai' || (blurFemales && p.className === 'Sexy')) && p.probability > threshold
-    );
-
-    if (isNSFW) {
-      blurElement(video);
-    }
-  } catch (error) {
-    // console.error('Error analyzing video frame', error);
+    if (isFlagged(toScores(await m.classify(canvas)))) blurElement(video);
+  } catch {
+    // Cross-origin video frames cannot be read
   }
 };
 
-// Analyze a single media element
-const analyzeMedia = async (el: HTMLElement) => {
-  if (!isEnabled || !model) return;
-
+const analyzeMedia = (el: HTMLElement) => {
+  if (!isEnabled) return;
   if (el.tagName === 'IMG') {
     const img = el as HTMLImageElement;
-    if (!img.src || img.src.startsWith('data:')) return;
-    await processImageUrl(img.src, el);
+    const src = img.currentSrc || img.src;
+    if (!src || src.startsWith('data:') || src.startsWith('blob:')) { releaseElement(el); return; }
+    if (img.complete && (img.naturalWidth < MIN_SIZE || img.naturalHeight < MIN_SIZE) && img.naturalWidth > 0) { releaseElement(el); return; }
+    holdElement(el);
+    enqueue(() => processImageUrl(src, el));
   } else if (el.tagName === 'VIDEO') {
     const video = el as HTMLVideoElement;
-    
-    // Analyze current frame
-    analyzeVideoFrame(video);
-    
-    // Setup periodic checking if playing
+    enqueue(() => analyzeVideoFrame(video));
     if (!video.hasAttribute('data-taqwashield-video-listener')) {
       video.setAttribute('data-taqwashield-video-listener', 'true');
-      
-      let intervalId: any;
+      const stop = () => {
+        const id = videoTimers.get(video);
+        if (id !== undefined) { clearInterval(id); videoTimers.delete(video); }
+      };
       video.addEventListener('play', () => {
-        intervalId = setInterval(() => {
-          if (!video.paused && !video.ended) {
-            analyzeVideoFrame(video);
-          }
-        }, 2000); // Check every 2 seconds
+        stop();
+        videoTimers.set(video, window.setInterval(() => {
+          if (!video.isConnected) return stop();
+          if (!video.paused && !video.ended) enqueue(() => analyzeVideoFrame(video));
+        }, 2000));
       });
-      
-      video.addEventListener('pause', () => clearInterval(intervalId));
-      video.addEventListener('ended', () => clearInterval(intervalId));
+      video.addEventListener('pause', stop);
+      video.addEventListener('ended', stop);
     }
   } else {
-    // Check background image
-    const bgImage = window.getComputedStyle(el).backgroundImage;
-    if (bgImage && bgImage !== 'none' && bgImage.startsWith('url(')) {
-      const url = bgImage.slice(4, -1).replace(/["']/g, '');
-      if (!url || url.startsWith('data:')) return;
-      await processImageUrl(url, el);
+    // Background images, only on elements that actually have one
+    const bg = window.getComputedStyle(el).backgroundImage;
+    if (bg && bg.startsWith('url(')) {
+      const url = bg.slice(4, -1).replace(/["']/g, '');
+      if (!url || url.startsWith('data:') || url.startsWith('blob:')) return;
+      enqueue(() => processImageUrl(url, el));
     }
   }
 };
 
-// Intersection Observer to only analyze media in viewport
+// Only analyze media that is near the viewport
 const observer = new IntersectionObserver((entries) => {
-  entries.forEach(entry => {
-    if (entry.isIntersecting) {
-      const el = entry.target as HTMLElement;
-      analyzeMedia(el);
-      if (el.tagName !== 'VIDEO') {
-        observer.unobserve(el); // Only analyze images/bg-images once
-      }
-    }
+  entries.forEach((entry) => {
+    if (!entry.isIntersecting) return;
+    const el = entry.target as HTMLElement;
+    analyzeMedia(el);
+    if (el.tagName !== 'VIDEO') observer.unobserve(el);
   });
-}, {
-  rootMargin: '200px'
-});
+}, { rootMargin: '200px' });
 
-// Scan all media currently on the page
+const SELECTOR = 'img, video, div, section, header, article, span, a';
+const observeEl = (el: Element) => {
+  if (el.hasAttribute('data-taqwashield-observed')) return;
+  el.setAttribute('data-taqwashield-observed', 'true');
+  observer.observe(el);
+  // Hide images from the first moment so nothing flashes before it is checked
+  if (el.tagName === 'IMG') holdElement(el as HTMLElement);
+};
 const scanAllMedia = () => {
   if (!isEnabled) return;
-  
-  // Select images, videos, and elements that might have background images (divs, sections, headers, etc)
-  const elements = document.querySelectorAll('img, video, div, section, header, article, span, a');
-  
-  elements.forEach(el => {
-    if (!el.hasAttribute('data-taqwashield-observed')) {
-      el.setAttribute('data-taqwashield-observed', 'true');
-      observer.observe(el as HTMLElement);
-    }
-  });
+  document.querySelectorAll(SELECTOR).forEach(observeEl);
 };
 
-// Mutation Observer to handle dynamically added media
 const mutationObserver = new MutationObserver((mutations) => {
   if (!isEnabled) return;
-  mutations.forEach(mutation => {
-    mutation.addedNodes.forEach(node => {
-      if (node.nodeType === Node.ELEMENT_NODE) {
-        const element = node as HTMLElement;
-        
-        if (element.tagName === 'IMG' || element.tagName === 'VIDEO') {
-          element.setAttribute('data-taqwashield-observed', 'true');
-          observer.observe(element);
-        }
-        
-        // Also check children
-        const children = element.querySelectorAll('img, video, div, section, header, article, span, a');
-        children.forEach(child => {
-          if (!child.hasAttribute('data-taqwashield-observed')) {
-            child.setAttribute('data-taqwashield-observed', 'true');
-            observer.observe(child as HTMLElement);
-          }
-        });
-      }
+  for (const mutation of mutations) {
+    mutation.addedNodes.forEach((node) => {
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const element = node as Element;
+      observeEl(element);
+      element.querySelectorAll(SELECTOR).forEach(observeEl);
     });
-  });
+    // A swapped image source needs a fresh check
+    if (mutation.type === 'attributes' && (mutation.target as Element).tagName === 'IMG') {
+      const img = mutation.target as HTMLElement;
+      img.removeAttribute('data-taqwashield-observed');
+      img.removeAttribute('data-taqwashield-blurred');
+      observeEl(img);
+    }
+  }
 });
 
-// Main initialization
-const init = async () => {
-  await initSettings();
-  if (isEnabled) {
-    await loadModel();
-    scanAllMedia();
-    mutationObserver.observe(document.body, {
-      childList: true,
-      subtree: true
-    });
-  }
+const startObserving = () => {
+  if (started) return;
+  started = true;
+  mutationObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'srcset'] });
 };
 
-// Start the extension
+const rescan = () => {
+  document.querySelectorAll('[data-taqwashield-observed]').forEach((el) => el.removeAttribute('data-taqwashield-observed'));
+  unblurAllMedia();
+  scanAllMedia();
+};
+
+const initSettings = () =>
+  new Promise<void>((resolve) => {
+    if (typeof chrome === 'undefined' || !chrome.storage) return resolve();
+    chrome.storage.local.get(['enabled', 'sensitivity', 'blurFemales'], (result) => {
+      isEnabled = (result.enabled as boolean) ?? true;
+      sensitivity = (result.sensitivity as string) ?? 'Medium';
+      blurFemales = (result.blurFemales as boolean) ?? true;
+      resolve();
+    });
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local') return;
+      // blurCount changes on every blur, so ignore everything except the real settings
+      if (!changes.enabled && !changes.sensitivity && !changes.blurFemales) return;
+      if (changes.enabled) isEnabled = changes.enabled.newValue as boolean;
+      if (changes.sensitivity) sensitivity = changes.sensitivity.newValue as string;
+      if (changes.blurFemales) blurFemales = changes.blurFemales.newValue as boolean;
+      if (!isEnabled) { unblurAllMedia(); return; }
+      loadModel().then(() => { startObserving(); rescan(); });
+    });
+  });
+
+const init = async () => {
+  await initSettings();
+  if (!isEnabled) return;
+  startObserving();
+  scanAllMedia(); // images are held (blurred) right away, then released once judged safe
+  await loadModel();
+};
+
 init();
