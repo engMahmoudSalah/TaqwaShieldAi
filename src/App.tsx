@@ -33,6 +33,7 @@ export default function App() {
       <div className="fixed bottom-6 right-6 md:bottom-8 md:right-8 z-50 flex flex-col items-end gap-4">
         <button 
           onClick={toggleEnabled}
+          title={enabled ? 'الحماية مفعلة' : 'الحماية معطلة'}
           className={`text-white p-4 rounded-full shadow-2xl hover:scale-105 transition-all flex items-center gap-3 ring-4 ${
             enabled 
               ? 'bg-emerald-600 hover:bg-emerald-700 ring-emerald-600/30' 
@@ -40,7 +41,7 @@ export default function App() {
           }`}
         >
           {enabled ? <ShieldCheck size={28} /> : <ShieldOff size={28} />}
-          <span className="font-bold text-lg hidden sm:inline">
+          <span className="sr-only">
             {enabled ? 'الحماية مفعلة' : 'الحماية معطلة'}
           </span>
         </button>
