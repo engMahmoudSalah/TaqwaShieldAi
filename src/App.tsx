@@ -137,17 +137,9 @@ export default function App() {
                 <EyeOff className="text-rose-500 w-6 h-6" /> اختبار التعتيم الحي
               </h2>
               <p className="text-sm sm:text-base text-slate-600 dark:text-blue-300 mb-6 leading-relaxed">
-                هذه صورة تجريبية. إذا كان سكريبت الفحص يعمل، فسيقوم بتحليل هذه الصورة. 
-                (ملاحظة: قد لا يقوم النموذج بتعتيم هذه الصورة الآمنة تحديداً، لكن عملية الفحص نشطة).
+                جرّب مستويات الحساسية على صورة تجريبية آمنة لترى كيف يبدو التعتيم قبل أن تزيله. هذه معاينة توضيحية للشكل فقط، والفحص الفعلي يتم داخل الإضافة.
               </p>
-              <div className="relative rounded-2xl overflow-hidden bg-slate-100 dark:bg-[#0a192f] aspect-video flex items-center justify-center border border-slate-200 dark:border-blue-900/50">
-                <img 
-                  src="https://picsum.photos/seed/taqwashield/800/450" 
-                  alt="صورة تجريبية" 
-                  className="w-full h-full object-cover"
-                  crossOrigin="anonymous"
-                />
-              </div>
+              <BlurDemo />
             </section>
           </div>
 
@@ -190,6 +182,40 @@ function FeatureCard({ icon, title, desc }: { icon: React.ReactNode, title: stri
       </div>
       <h3 className="text-lg sm:text-xl font-bold text-slate-800 dark:text-blue-100 mb-3">{title}</h3>
       <p className="text-sm sm:text-base text-slate-600 dark:text-blue-300 leading-relaxed">{desc}</p>
+    </div>
+  );
+}
+
+function BlurDemo() {
+  const [level, setLevel] = React.useState(1);
+  const [shown, setShown] = React.useState(false);
+  const px = shown ? 0 : [8, 18, 34][level];
+  const names = ['منخفض', 'متوسط', 'عالي'];
+  return (
+    <div>
+      <div className="relative rounded-2xl overflow-hidden aspect-video border border-slate-200 dark:border-blue-800/30">
+        <svg viewBox="0 0 800 450" className="w-full h-full block" role="img" aria-label="منظر طبيعي توضيحي" style={{ filter: `blur(${px}px)`, transition: 'filter .35s' }}>
+          <defs>
+            <linearGradient id="sk" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#f6b26b" /><stop offset="1" stopColor="#f9e2b8" /></linearGradient>
+          </defs>
+          <rect width="800" height="450" fill="url(#sk)" />
+          <circle cx="600" cy="130" r="56" fill="#fff4d6" />
+          <path d="M0 300 L150 170 L260 260 L400 130 L560 280 L680 200 L800 290 V450 H0Z" fill="#2f6f5e" />
+          <path d="M0 360 Q200 300 400 350 T800 340 V450 H0Z" fill="#1b4d40" />
+          <rect x="120" y="318" width="70" height="46" fill="#7a4b2a" /><path d="M110 320 L155 280 L200 320Z" fill="#a33b2c" />
+        </svg>
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none" aria-hidden="true">
+          {!shown && <span className="px-4 py-2 rounded-full bg-black/60 text-white text-sm font-bold">تم التعتيم</span>}
+        </div>
+      </div>
+      <div className="mt-5 flex flex-wrap items-center gap-3" role="group" aria-label="مستوى الحساسية">
+        {names.map((n, k) => (
+          <button key={n} type="button" onClick={() => setLevel(k)} aria-pressed={level === k}
+            className={`px-4 py-2 rounded-full text-sm font-bold border transition-colors cursor-pointer ${level === k ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-white dark:bg-[#0a192f] text-slate-700 dark:text-blue-200 border-slate-300 dark:border-blue-800'}`}>{n}</button>
+        ))}
+        <button type="button" onClick={() => setShown(v => !v)} aria-pressed={shown}
+          className="ms-auto px-4 py-2 rounded-full text-sm font-bold bg-slate-800 text-white dark:bg-blue-200 dark:text-[#0a192f] cursor-pointer">{shown ? 'أعد التعتيم' : 'إزالة التعتيم'}</button>
+      </div>
     </div>
   );
 }
